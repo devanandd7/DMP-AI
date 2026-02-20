@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+groq
+requests
+python-dotenv
+python-jose[cryptography]
+httpx
+motor
+pymongo

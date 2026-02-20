@@ -1,0 +1,3 @@
+mongodb+srv://devanandutkarsh7_db_user:cPWgAwiQCoqbVx3F@cluster0.gf6y7if.mongodb.net/
+
+GROQ_KEY_1=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

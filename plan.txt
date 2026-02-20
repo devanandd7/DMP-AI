@@ -1,0 +1,231 @@
+## Ye Sahi Direction Hai — Chalo Banate Hain
+
+### Architecture
+
+```
+Customer → "sk-myai-xxxx" key → Tumhara API → Groq/Gemini → Response
+           Model: "myai-fast"        (internally llama/gemini)
+```
+
+Customer ko pata nahi chalega andar kya hai.
+
+---
+
+## Code — Poora System
+
+### Folder Structure
+```
+myai-api/
+├── main.py
+├── keys.py
+├── models.py
+└── requirements.txt
+```
+
+**requirements.txt:**
+```
+fastapi
+uvicorn
+groq
+requests
+python-dotenv
+```
+
+---
+
+**models.py** — Tumhare custom model names:
+```python
+# Tumhara model name → actual model mapping
+MODEL_MAP = {
+    "myai-fast": {
+        "provider": "groq",
+        "model": "llama-3.1-8b-instant"
+    },
+    "myai-pro": {
+        "provider": "groq", 
+        "model": "mixtral-8x7b-32768"
+    },
+    "myai-smart": {
+        "provider": "gemini",
+        "model": "gemini-1.5-flash"
+    }
+}
+```
+
+---
+
+**main.py:**
+```python
+from fastapi import FastAPI, HTTPException, Header
+from groq import Groq
+import requests, sqlite3, secrets, json
+from models import MODEL_MAP
+
+app = FastAPI(title="MyAI API")
+
+# Tumhare backend keys
+GROQ_KEYS = ["gsk_key1", "gsk_key2", "gsk_key3"]
+GEMINI_KEYS = ["gemini_key1", "gemini_key2"]
+groq_index = 0
+
+# DB setup
+conn = sqlite3.connect('myai.db', check_same_thread=False)
+conn.execute('''CREATE TABLE IF NOT EXISTS users 
+                (key TEXT PRIMARY KEY, plan TEXT, used_today INT, created TEXT)''')
+conn.commit()
+
+def verify_key(api_key: str):
+    cur = conn.execute('SELECT * FROM users WHERE key = ?', (api_key,))
+    return cur.fetchone()
+
+def call_groq(model: str, messages: list):
+    global groq_index
+    key = GROQ_KEYS[groq_index % len(GROQ_KEYS)]
+    try:
+        client = Groq(api_key=key)
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=1024
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        groq_index += 1  # Key rotate karo
+        raise HTTPException(status_code=500, detail="Retry karo")
+
+def call_gemini(model: str, messages: list):
+    key = GEMINI_KEYS[0]
+    # Gemini ka format alag hai
+    prompt = messages[-1]["content"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    res = requests.post(url, json=body)
+    return res.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+# Main chat endpoint — OpenAI jaisa format
+@app.post("/v1/chat/completions")
+async def chat(request: dict, authorization: str = Header(...)):
+    
+    # Key extract karo "Bearer sk-myai-xxx" se
+    api_key = authorization.replace("Bearer ", "")
+    user = verify_key(api_key)
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Plan limits
+    limits = {"free": 50, "basic": 300, "pro": 1000}
+    limit = limits.get(user[1], 50)
+    
+    if user[2] >= limit:
+        raise HTTPException(status_code=429, 
+                          detail=f"Daily limit khatam. Upgrade karo.")
+    
+    # Model check
+    requested_model = request.get("model", "myai-fast")
+    if requested_model not in MODEL_MAP:
+        raise HTTPException(status_code=400, 
+                          detail=f"Model nahi mila. Available: {list(MODEL_MAP.keys())}")
+    
+    model_config = MODEL_MAP[requested_model]
+    messages = request.get("messages", [])
+    
+    # Provider ke hisab se call karo
+    if model_config["provider"] == "groq":
+        result = call_groq(model_config["model"], messages)
+    else:
+        result = call_gemini(model_config["model"], messages)
+    
+    # Usage update
+    conn.execute('UPDATE users SET used_today = used_today + 1 WHERE key = ?', (api_key,))
+    conn.commit()
+    
+    # OpenAI jaisa response format — compatible hoga sabse
+    return {
+        "id": "myai-" + secrets.token_hex(8),
+        "object": "chat.completion",
+        "model": requested_model,
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": result
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+    }
+
+# Tumhare liye — naya customer key banana
+@app.post("/admin/generate-key")
+async def generate_key(plan: str = "free", admin: str = Header(...)):
+    if admin != "TUMHARA-SECRET-PASS":
+        raise HTTPException(status_code=403)
+    
+    new_key = "sk-myai-" + secrets.token_hex(20)
+    conn.execute('INSERT INTO users VALUES (?, ?, 0, date("now"))', (new_key, plan))
+    conn.commit()
+    return {"key": new_key, "plan": plan}
+
+# Available models list
+@app.get("/v1/models")
+async def list_models(authorization: str = Header(...)):
+    return {
+        "data": [
+            {"id": "myai-fast", "description": "Fast responses"},
+            {"id": "myai-pro", "description": "Better quality"},
+            {"id": "myai-smart", "description": "Most capable"}
+        ]
+    }
+```
+
+---
+
+## Railway Pe Deploy Kaise Karo
+
+```bash
+# Railway CLI install karo
+npm install -g @railway/cli
+
+# Login
+railway login
+
+# Project banao
+railway init
+
+# Deploy
+railway up
+```
+
+Bas — tumhara API live ho jayega ek URL pe jaise `myai-api.railway.app`
+
+---
+
+## Customer Aise Use Karega
+
+```python
+import openai
+
+client = openai.OpenAI(
+    api_key="sk-myai-xxxxxxxxxxxx",  # tumhari key
+    base_url="https://myai-api.railway.app/v1"
+)
+
+response = client.chat.completions.create(
+    model="myai-fast",  # tumhara custom model naam
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
+
+**OpenAI compatible format** rakha hai — isliye koi bhi existing OpenAI code seedha tumhari API pe kaam karega, sirf `base_url` aur `api_key` badlega.
+
+---
+
+## Next Steps
+
+Ye banao pehle, test karo locally:
+```bash
+pip install fastapi uvicorn groq requests
+uvicorn main:app --reload
+```
+
+Kaam kare to Railway pe daalo. Phir landing page. Koi atak jao to batao.
