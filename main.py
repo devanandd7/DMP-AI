@@ -28,16 +28,20 @@ MongoDB User Document Schema:
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 from groq import Groq
 import requests as req_lib
-import secrets, os
+import secrets, os, io, time
+import uvicorn
+from collections import deque
 from datetime import datetime, date, timezone
 from dotenv import load_dotenv
 from models import MODEL_MAP
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING
 from pymongo.errors import DuplicateKeyError
+import edge_tts
 
 load_dotenv()
 
@@ -48,7 +52,19 @@ ADMIN_SECRET    = os.getenv("ADMIN_SECRET",    "change-this-secret")
 FRONTEND_SECRET = os.getenv("FRONTEND_SECRET", "dmp-frontend-secret")  # shared with Next.js frontend
 MONGODB_URI     = os.getenv("MONGODB_URI",     "mongodb://localhost:27017")
 
-PLAN_LIMITS = {"free": 50, "basic": 300, "pro": 1000}
+# ── Per-plan daily call limits (doubled) ─────────────────────────────────────
+PLAN_LIMITS          = {"free": 100, "basic": 600, "pro": 2000}
+TTS_DAILY_CHAR_LIMIT = 54_333   # characters per TTS key per day
+
+# ── Per-key rate limits (apply to ALL plans / ALL models) ─────────────────────
+RPM_LIMIT           = 30       # 30 requests per 60-second window
+TPM_LIMIT           = 35_000   # 35,000 tokens per 60-second window
+DAILY_REQUEST_LIMIT = 350      # hard cap: 350 requests per calendar day
+
+# In-memory sliding windows keyed by api_key
+# Each entry is a deque of (timestamp_float, tokens_used_int)
+_rpm_windows: dict[str, deque] = {}
+_tpm_windows: dict[str, deque] = {}
 
 groq_index   = 0
 gemini_index = 0
@@ -56,6 +72,7 @@ gemini_index = 0
 # ─── MongoDB Setup ─────────────────────────────────────────────────────────────
 mongo_client: AsyncIOMotorClient = None   # type: ignore
 users_col = None
+tts_col   = None
 
 
 def now_iso() -> str:
@@ -68,16 +85,19 @@ def today_str() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mongo_client, users_col
+    global mongo_client, users_col, tts_col
     try:
         mongo_client = AsyncIOMotorClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
         await mongo_client.admin.command("ping")
         db        = mongo_client["dmpai"]
         users_col = db["users"]
+        tts_col   = db["tts_keys"]
 
-        # Indexes
+        # Indexes — users
         await users_col.create_index([("key",           ASCENDING)], unique=True)
         await users_col.create_index([("clerk_user_id", ASCENDING)], sparse=True, unique=True)
+        # Indexes — tts_keys
+        await tts_col.create_index([("tts_key", ASCENDING)], unique=True)
 
         print("✅  MongoDB Atlas connected!")
     except Exception as e:
@@ -141,6 +161,50 @@ async def reset_daily_usage_if_needed(api_key: str, user: dict) -> dict:
         )
         user = dict(user, used_today=0, last_reset=today)
     return user
+
+
+def _check_rate_limits(api_key: str, token_count: int = 0) -> None:
+    """
+    Enforce per-minute rate limits using in-memory sliding windows.
+    Raises HTTP 429 if:
+      - RPM  > 30  in the last 60 s
+      - TPM  > 35,000 tokens in the last 60 s
+    Does NOT check the daily 350-request cap (that is checked via PLAN_LIMITS).
+    """
+    now = time.time()
+    window = 60.0  # 1-minute sliding window
+
+    # ── requests per minute ───────────────────────────────────────────────────
+    if api_key not in _rpm_windows:
+        _rpm_windows[api_key] = deque()
+    rpm_dq = _rpm_windows[api_key]
+    # evict old entries
+    while rpm_dq and now - rpm_dq[0][0] > window:
+        rpm_dq.popleft()
+    if len(rpm_dq) >= RPM_LIMIT:
+        retry_after = int(window - (now - rpm_dq[0][0])) + 1
+        raise HTTPException(
+            429,
+            f"Rate limit: {RPM_LIMIT} requests/min exceeded. "
+            f"Retry after ~{retry_after}s."
+        )
+    rpm_dq.append((now, token_count))
+
+    # ── tokens per minute ─────────────────────────────────────────────────────
+    if api_key not in _tpm_windows:
+        _tpm_windows[api_key] = deque()
+    tpm_dq = _tpm_windows[api_key]
+    while tpm_dq and now - tpm_dq[0][0] > window:
+        tpm_dq.popleft()
+    tokens_in_window = sum(t for _, t in tpm_dq)
+    if tokens_in_window + token_count > TPM_LIMIT:
+        retry_after = int(window - (now - tpm_dq[0][0])) + 1 if tpm_dq else 60
+        raise HTTPException(
+            429,
+            f"Rate limit: {TPM_LIMIT:,} tokens/min would be exceeded "
+            f"({tokens_in_window:,} used). Retry after ~{retry_after}s."
+        )
+    tpm_dq.append((now, token_count))
 
 
 async def create_user_doc(
@@ -262,15 +326,26 @@ async def chat(request: Request, authorization: str = Header(...)):
     # Daily reset
     user = await reset_daily_usage_if_needed(api_key, user)
 
-    # Rate limit
+    # ── Daily limit (plan-based) ──────────────────────────────────────────────
     plan       = user.get("plan", "free")
-    limit      = PLAN_LIMITS.get(plan, 50)
+    limit      = PLAN_LIMITS.get(plan, 100)
     used_today = user.get("used_today", 0)
     if used_today >= limit:
         raise HTTPException(
             429,
-            f"Daily limit reached ({used_today}/{limit}) for plan '{plan}'. Please upgrade."
+            f"Daily limit reached ({used_today}/{limit}) for plan '{plan}'. "
+            f"Upgrade or wait until tomorrow."
         )
+    # Hard daily cap (applies to all plans)
+    if used_today >= DAILY_REQUEST_LIMIT:
+        raise HTTPException(
+            429,
+            f"Hard daily cap of {DAILY_REQUEST_LIMIT} requests reached. Resets tomorrow."
+        )
+
+    # ── Per-minute rate limits (RPM + TPM) — checked before provider call ────
+    # We estimate 0 tokens here; the window records actual tokens after the call.
+    _check_rate_limits(api_key, token_count=0)
 
     # Parse
     body            = await request.json()
@@ -291,6 +366,10 @@ async def chat(request: Request, authorization: str = Header(...)):
     result = (call_groq(cfg["model"], messages, max_tokens)
               if cfg["provider"] == "groq"
               else call_gemini(cfg["model"], messages))
+
+    # Record actual token count into the TPM window (rough estimate via char count)
+    approx_tokens = max(1, len(result) // 4 + sum(len(str(m)) for m in messages) // 4)
+    _check_rate_limits(api_key, token_count=approx_tokens)
 
     # Update usage stats atomically
     await users_col.update_one(
@@ -446,32 +525,48 @@ async def admin_generate_key(plan: str = "free", x_admin_secret: str = Header(..
 
 
 @app.get("/admin/users", tags=["Admin"])
-async def admin_list_users(x_admin_secret: str = Header(...)):
-    """List all users with full profile and usage stats."""
+async def admin_list_users(
+    x_admin_secret: str = Header(...),
+    skip: int = 0,
+    limit: int = 50,
+    plan: str | None = None,
+    active: bool | None = None,
+):
+    """List all chat API users with full stats + their linked TTS keys."""
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(403, "Invalid admin secret.")
     _db_check()
 
-    docs = await users_col.find({}, {"_id": 0}).to_list(length=5000)
-    return {
-        "total": len(docs),
-        "users": [
-            {
-                "key":            u.get("key", "")[:14] + "...",
-                "plan":           u.get("plan"),
-                "used_today":     u.get("used_today", 0),
-                "total_calls":    u.get("total_calls", 0),
-                "daily_limit":    PLAN_LIMITS.get(u.get("plan", "free"), 50),
-                "last_reset":     u.get("last_reset"),
-                "created_at":     u.get("created_at"),
-                "last_active_at": u.get("last_active_at"),
-                "is_active":      u.get("is_active", True),
-                "has_clerk":      bool(u.get("clerk_user_id")),
-                "profile":        u.get("profile", {}),
-            }
-            for u in docs
-        ],
-    }
+    query: dict = {}
+    if plan:
+        query["plan"] = plan
+    if active is not None:
+        query["is_active"] = active
+
+    cursor     = users_col.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit)
+    users_list = []
+    async for u in cursor:
+        raw_key = u.get("key", "")
+        # Count linked TTS keys
+        tts_count = await tts_col.count_documents({"linked_dmp_key": raw_key}) if raw_key else 0
+        users_list.append({
+            "key":            raw_key[:14] + "..." if raw_key else "—",
+            "plan":           u.get("plan", "free"),
+            "used_today":     u.get("used_today", 0),
+            "total_calls":    u.get("total_calls", 0),
+            "daily_limit":    PLAN_LIMITS.get(u.get("plan", "free"), 100),
+            "last_reset":     u.get("last_reset"),
+            "created_at":     u.get("created_at"),
+            "last_active_at": u.get("last_active_at"),
+            "is_active":      u.get("is_active", True),
+            "clerk_user_id":  u.get("clerk_user_id"),
+            "profile":        u.get("profile", {}),
+            "tts_keys_count": tts_count,
+            "services":       ["chat"] + (["tts"] if tts_count > 0 else []),
+        })
+
+    total = await users_col.count_documents(query)
+    return {"total": total, "skip": skip, "limit": limit, "users": users_list}
 
 
 @app.patch("/admin/upgrade-plan", tags=["Admin"])
@@ -518,36 +613,403 @@ async def admin_revoke_key(api_key: str, x_admin_secret: str = Header(...)):
 
 @app.get("/admin/stats", tags=["Admin"])
 async def admin_stats(x_admin_secret: str = Header(...)):
-    """Dashboard stats: users by plan, total calls, active users."""
+    """Rich dashboard stats: chat users + TTS keys combined."""
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(403, "Invalid admin secret.")
     _db_check()
+    from datetime import timedelta
 
-    pipeline = [
+    # ── Chat users aggregate ─────────────────────────────────────
+    plan_pipeline = [
         {"$group": {
             "_id":          "$plan",
-            "count":        {"$sum": 1},
+            "users":        {"$sum": 1},
             "calls_today":  {"$sum": "$used_today"},
             "total_calls":  {"$sum": "$total_calls"},
             "active_users": {"$sum": {"$cond": ["$is_active", 1, 0]}},
         }}
     ]
-    results     = await users_col.aggregate(pipeline).to_list(100)
-    total_users = sum(r["count"] for r in results)
-    total_today = sum(r["calls_today"] for r in results)
-    total_all   = sum(r["total_calls"] for r in results)
+    plan_results = await users_col.aggregate(plan_pipeline).to_list(100)
+    total_users  = sum(r["users"] for r in plan_results)
+    total_today  = sum(r["calls_today"] for r in plan_results)
+    total_ever   = sum(r["total_calls"] for r in plan_results)
+    active_users = sum(r["active_users"] for r in plan_results)
+
+    week_ago    = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    active_week = await users_col.count_documents({"last_active_at": {"$gte": week_ago}})
+
+    # ── TTS aggregate ─────────────────────────────────────────────
+    total_tts_keys  = await tts_col.count_documents({})
+    active_tts_keys = await tts_col.count_documents({"is_active": True})
+    tts_agg_pipe    = [{"$group": {"_id": None,
+                                   "total_chars": {"$sum": "$total_chars"},
+                                   "chars_today": {"$sum": "$chars_today"}}}]
+    tts_agg_res = await tts_col.aggregate(tts_agg_pipe).to_list(1)
+    tts_agg     = tts_agg_res[0] if tts_agg_res else {"total_chars": 0, "chars_today": 0}
 
     return {
-        "total_users":        total_users,
-        "total_calls_today":  total_today,
-        "total_calls_ever":   total_all,
-        "by_plan": {
-            r["_id"]: {
-                "users":        r["count"],
-                "calls_today":  r["calls_today"],
-                "total_calls":  r["total_calls"],
-                "active_users": r["active_users"],
-            }
-            for r in results
+        "chat": {
+            "total_users":      total_users,
+            "active_users":     active_users,
+            "users_with_key":   total_users,
+            "active_this_week": active_week,
+            "plan_breakdown":   {
+                r["_id"]: {
+                    "users":        r["users"],
+                    "calls_today":  r["calls_today"],
+                    "total_calls":  r["total_calls"],
+                    "active_users": r["active_users"],
+                }
+                for r in plan_results
+            },
+            "total_api_calls":  total_ever,
+            "calls_today":      total_today,
+        },
+        "tts": {
+            "total_tts_keys":          total_tts_keys,
+            "active_tts_keys":         active_tts_keys,
+            "total_chars_synthesized": tts_agg.get("total_chars", 0),
+            "chars_today":             tts_agg.get("chars_today", 0),
+            "daily_limit_per_key":     TTS_DAILY_CHAR_LIMIT,
+        },
+        "generated_at": now_iso(),
+    }
+
+
+@app.get("/admin/tts-users", tags=["Admin"])
+async def admin_list_tts_users(
+    x_admin_secret: str = Header(...),
+    skip: int = 0,
+    limit: int = 50,
+    active: bool | None = None,
+):
+    """List all TTS key holders with usage stats. Supports pagination + filtering."""
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(403, "Invalid admin secret.")
+    _db_check()
+
+    query: dict = {}
+    if active is not None:
+        query["is_active"] = active
+
+    cursor   = tts_col.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit)
+    tts_list = []
+    async for doc in cursor:
+        if doc.get("tts_key"):
+            doc["tts_key"] = doc["tts_key"][:18] + "..."
+        tts_list.append(doc)
+
+    total = await tts_col.count_documents(query)
+    return {"total": total, "skip": skip, "limit": limit, "tts_keys": tts_list}
+
+
+#
+# Available voices (pass as "voice" field in /v1/tts/synthesize):
+#
+# ENGLISH (en-US)
+#   en-US-AvaMultilingualNeural        Female, multilingual (best for Hinglish)
+#   en-US-AndrewMultilingualNeural     Male,   multilingual
+#   en-US-EmmaMultilingualNeural       Female, multilingual
+#   en-US-BrianMultilingualNeural      Male,   multilingual
+#   en-US-AvaNeural                    Female, natural
+#   en-US-AndrewNeural                 Male,   natural
+#   en-US-AriaNeural                   Female, expressive
+#   en-US-ChristopherNeural            Male,   expressive
+#   en-US-GuyNeural                    Male,   natural
+#   en-US-JennyNeural                  Female, news/chat
+#   en-US-MichelleNeural               Female, friendly
+#   en-US-RogerNeural                  Male,   natural
+#   en-US-SteffanNeural                Male,   natural
+#
+# ENGLISH (en-IN — India accent)
+#   en-IN-NeerjaExpressiveNeural       Female, expressive
+#   en-IN-NeerjaNeural                 Female
+#   en-IN-PrabhatNeural                Male
+#
+# ENGLISH (en-GB)
+#   en-GB-SoniaNeural                  Female
+#   en-GB-RyanNeural                   Male
+#   en-GB-LibbyNeural                  Female
+#   en-GB-MaisieNeural                 Female, child
+#
+# HINDI (hi-IN)
+#   hi-IN-SwaraNeural                  Female  ← best Hindi female
+#   hi-IN-MadhurNeural                 Male    ← best Hindi male
+#
+# DEFAULT VOICE: en-US-AvaMultilingualNeural  (handles English + Hindi + Hinglish)
+# ─────────────────────────────────────────────────────────────────────────────
+
+TTS_VOICES = [
+    # ── English US ────────────────────────────────────────────────────────────
+    {"id": "en-US-AvaMultilingualNeural",    "language": "en-US", "gender": "Female", "style": "Multilingual (best for Hinglish)"},
+    {"id": "en-US-AndrewMultilingualNeural", "language": "en-US", "gender": "Male",   "style": "Multilingual"},
+    {"id": "en-US-EmmaMultilingualNeural",   "language": "en-US", "gender": "Female", "style": "Multilingual"},
+    {"id": "en-US-BrianMultilingualNeural",  "language": "en-US", "gender": "Male",   "style": "Multilingual"},
+    {"id": "en-US-AvaNeural",                "language": "en-US", "gender": "Female", "style": "Natural"},
+    {"id": "en-US-AndrewNeural",             "language": "en-US", "gender": "Male",   "style": "Natural"},
+    {"id": "en-US-AriaNeural",               "language": "en-US", "gender": "Female", "style": "Expressive"},
+    {"id": "en-US-ChristopherNeural",        "language": "en-US", "gender": "Male",   "style": "Expressive"},
+    {"id": "en-US-GuyNeural",                "language": "en-US", "gender": "Male",   "style": "Natural"},
+    {"id": "en-US-JennyNeural",              "language": "en-US", "gender": "Female", "style": "News/Chat"},
+    {"id": "en-US-MichelleNeural",           "language": "en-US", "gender": "Female", "style": "Friendly"},
+    {"id": "en-US-RogerNeural",              "language": "en-US", "gender": "Male",   "style": "Natural"},
+    {"id": "en-US-SteffanNeural",            "language": "en-US", "gender": "Male",   "style": "Natural"},
+    # ── English India ─────────────────────────────────────────────────────────
+    {"id": "en-IN-NeerjaExpressiveNeural",   "language": "en-IN", "gender": "Female", "style": "Expressive"},
+    {"id": "en-IN-NeerjaNeural",             "language": "en-IN", "gender": "Female", "style": "Natural"},
+    {"id": "en-IN-PrabhatNeural",            "language": "en-IN", "gender": "Male",   "style": "Natural"},
+    # ── English UK ────────────────────────────────────────────────────────────
+    {"id": "en-GB-SoniaNeural",              "language": "en-GB", "gender": "Female", "style": "Natural"},
+    {"id": "en-GB-RyanNeural",               "language": "en-GB", "gender": "Male",   "style": "Natural"},
+    {"id": "en-GB-LibbyNeural",              "language": "en-GB", "gender": "Female", "style": "Natural"},
+    {"id": "en-GB-MaisieNeural",             "language": "en-GB", "gender": "Female", "style": "Child"},
+    # ── Hindi India ───────────────────────────────────────────────────────────
+    {"id": "hi-IN-SwaraNeural",              "language": "hi-IN", "gender": "Female", "style": "Natural"},
+    {"id": "hi-IN-MadhurNeural",             "language": "hi-IN", "gender": "Male",   "style": "Natural"},
+]
+
+TTS_VOICE_IDS = {v["id"] for v in TTS_VOICES}
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def _tts_db_check():
+    if tts_col is None:
+        raise HTTPException(503, "Database not connected. Check MONGODB_URI in .env")
+
+
+async def _get_tts_key(tts_key: str) -> dict | None:
+    _tts_db_check()
+    return await tts_col.find_one({"tts_key": tts_key}, {"_id": 0})
+
+
+async def _reset_tts_daily_if_needed(tts_key: str, doc: dict) -> dict:
+    today = today_str()
+    if doc.get("last_reset") != today:
+        await tts_col.update_one(
+            {"tts_key": tts_key},
+            {"$set": {"chars_today": 0, "last_reset": today}},
+        )
+        doc = dict(doc, chars_today=0, last_reset=today)
+    return doc
+
+
+async def _tts_auth(authorization: str) -> dict:
+    """Validate Bearer sk-tts-* key, reset daily counter, return doc."""
+    tts_key = authorization.replace("Bearer ", "").strip()
+    if not tts_key.startswith("sk-tts-"):
+        raise HTTPException(401, "Invalid TTS API key. Keys must start with 'sk-tts-'.")
+    doc = await _get_tts_key(tts_key)
+    if not doc:
+        raise HTTPException(401, "TTS API key not found.")
+    if not doc.get("is_active", True):
+        raise HTTPException(403, "TTS key is deactivated. Contact support.")
+    doc = await _reset_tts_daily_if_needed(tts_key, doc)
+    return doc
+
+
+# ── endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/v1/tts/voices", tags=["TTS"])
+async def tts_voices():
+    """
+    List all supported TTS voices.
+    No authentication required.
+    """
+    return {
+        "total":  len(TTS_VOICES),
+        "voices": TTS_VOICES,
+        "tip":    "For Hinglish (Hindi+English mixed), use en-US-AvaMultilingualNeural.",
+    }
+
+
+@app.post("/v1/tts/generate-key", tags=["TTS"])
+async def tts_generate_key(request: Request):
+    """
+    Generate a TTS API key (`sk-tts-*`).
+
+    Optional body fields:
+    - `label`         : friendly name for this key (default: "My TTS Key")
+    - `linked_dmp_key`: your existing `sk-dmp-*` chat key — links accounts
+
+    No mandatory auth — anyone can create a TTS key.
+    If you pass a valid `linked_dmp_key`, the TTS key will be associated
+    with your chat account for easier management.
+    """
+    _tts_db_check()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    label          = (body.get("label") or "My TTS Key").strip()[:80]
+    linked_dmp_key = (body.get("linked_dmp_key") or "").strip() or None
+
+    # Validate linked DMP key if provided
+    if linked_dmp_key:
+        dmp_user = await get_user_by_key(linked_dmp_key)
+        if not dmp_user:
+            raise HTTPException(400, "linked_dmp_key not found. Pass a valid sk-dmp-* key or omit it.")
+
+    new_tts_key = "sk-tts-" + secrets.token_hex(20)
+    doc = {
+        "tts_key":        new_tts_key,
+        "label":          label,
+        "chars_today":    0,
+        "last_reset":     today_str(),
+        "total_chars":    0,
+        "daily_limit":    TTS_DAILY_CHAR_LIMIT,
+        "created_at":     now_iso(),
+        "last_active_at": None,
+        "is_active":      True,
+        "linked_dmp_key": linked_dmp_key,
+    }
+    await tts_col.insert_one(doc)
+    doc.pop("_id", None)
+
+    return {
+        "tts_key":        new_tts_key,
+        "label":          label,
+        "daily_limit":    TTS_DAILY_CHAR_LIMIT,
+        "chars_today":    0,
+        "remaining":      TTS_DAILY_CHAR_LIMIT,
+        "created_at":     doc["created_at"],
+        "linked_dmp_key": linked_dmp_key,
+        "message":        "TTS API key generated! 🎉 Keep it safe — it's shown only once.",
+        "usage_example": {
+            "endpoint": "POST /v1/tts/synthesize",
+            "headers":  {"Authorization": f"Bearer {new_tts_key}"},
+            "body":     {"text": "Hello दोस्तों!", "voice": "en-US-AvaMultilingualNeural"},
         },
     }
+
+
+@app.get("/v1/tts/key-info", tags=["TTS"])
+async def tts_key_info(authorization: str = Header(...)):
+    """
+    Return current usage stats for a TTS API key.
+
+    Headers: `Authorization: Bearer sk-tts-<your-key>`
+    """
+    doc         = await _tts_auth(authorization)
+    chars_today = doc.get("chars_today", 0)
+    remaining   = max(0, TTS_DAILY_CHAR_LIMIT - chars_today)
+    return {
+        "tts_key":        doc["tts_key"][:14] + "...",
+        "label":          doc.get("label"),
+        "daily_limit":    TTS_DAILY_CHAR_LIMIT,
+        "chars_today":    chars_today,
+        "remaining":      remaining,
+        "total_chars":    doc.get("total_chars", 0),
+        "last_reset":     doc.get("last_reset"),
+        "created_at":     doc.get("created_at"),
+        "last_active_at": doc.get("last_active_at"),
+        "is_active":      doc.get("is_active", True),
+        "linked_dmp_key": bool(doc.get("linked_dmp_key")),
+    }
+
+
+@app.post("/v1/tts/synthesize", tags=["TTS"])
+async def tts_synthesize(request: Request, authorization: str = Header(...)):
+    """
+    Synthesize text to speech using Edge TTS.
+    Returns an **MP3 audio** stream directly in the response body.
+
+    Headers: `Authorization: Bearer sk-tts-<your-key>`
+
+    Body:
+    ```json
+    {
+      "text":   "Hello दोस्तों!",
+      "voice":  "en-US-AvaMultilingualNeural",
+      "rate":   "+0%",
+      "volume": "+0%"
+    }
+    ```
+
+    - `voice`  : see GET /v1/tts/voices for all options (default: en-US-AvaMultilingualNeural)
+    - `rate`   : speed adjustment e.g. "+10%", "-20%" (default: +0%)
+    - `volume` : volume adjustment e.g. "+10%", "-5%"  (default: +0%)
+
+    Daily limit: **54,333 characters/day** per key.
+    """
+    doc     = await _tts_auth(authorization)
+    tts_key = doc["tts_key"]
+
+    body   = await request.json()
+    text   = (body.get("text")   or "").strip()
+    voice  = (body.get("voice")  or "en-US-AvaMultilingualNeural").strip()
+    rate   = (body.get("rate")   or "+0%").strip()
+    volume = (body.get("volume") or "+0%").strip()
+
+    if not text:
+        raise HTTPException(400, "'text' field is required and must not be empty.")
+    if voice not in TTS_VOICE_IDS:
+        raise HTTPException(
+            400,
+            f"Unknown voice '{voice}'. Call GET /v1/tts/voices for the full list."
+        )
+
+    char_count  = len(text)
+    chars_today = doc.get("chars_today", 0)
+    remaining   = TTS_DAILY_CHAR_LIMIT - chars_today
+
+    if char_count > remaining:
+        raise HTTPException(
+            429,
+            f"Daily character limit reached. "
+            f"Used: {chars_today}/{TTS_DAILY_CHAR_LIMIT}. "
+            f"Remaining: {remaining} chars. "
+            f"This request needs {char_count} chars. Resets tomorrow."
+        )
+
+    # Synthesize with edge-tts into an in-memory buffer
+    try:
+        communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)
+        audio_buf   = io.BytesIO()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_buf.write(chunk["data"])
+        audio_buf.seek(0)
+        audio_bytes = audio_buf.read()
+    except Exception as exc:
+        raise HTTPException(502, f"Edge TTS error: {exc}")
+
+    if not audio_bytes:
+        raise HTTPException(502, "Edge TTS returned empty audio. Try a different voice or text.")
+
+    # Update usage stats atomically
+    await tts_col.update_one(
+        {"tts_key": tts_key},
+        {
+            "$inc": {"chars_today": char_count, "total_chars": char_count},
+            "$set": {"last_active_at": now_iso()},
+        },
+    )
+
+    return StreamingResponse(
+        io.BytesIO(audio_bytes),
+        media_type="audio/mpeg",
+        headers={
+            "X-Chars-Used":        str(chars_today + char_count),
+            "X-Chars-Remaining":   str(remaining - char_count),
+            "X-Daily-Limit":       str(TTS_DAILY_CHAR_LIMIT),
+            "X-Voice":             voice,
+            "Content-Disposition": 'inline; filename="tts_output.mp3"',
+        },
+    )
+
+
+
+
+
+
+# ─── Entry Point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("\n" + "=" * 55)
+    print("  🚀  DMP AI API Server")
+    print("=" * 55)
+    print("  📡  URL      : http://localhost:8000")
+    print("  📖  Docs     : http://localhost:8000/docs")
+    print("  🔄  Mode     : Auto-reload ON")
+    print("  🛑  Stop     : Press Ctrl+C")
+    print("=" * 55 + "\n")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
