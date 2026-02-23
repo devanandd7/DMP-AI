@@ -7,3 +7,5 @@ python-jose[cryptography]
 httpx
 motor
 pymongo
+edge-tts
+google-genai
